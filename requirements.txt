@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+supabase
+pandas
+numpy
+matplotlib
+fpdf2
+requests
+openpyxl
+Pillow
