@@ -21,6 +21,8 @@ from hr_analytics import clusterize, cluster_summary, band_counts_health, build_
 from questions import EXAM_PACKAGES
 from bei import (BEI_PROMPTS, STRUCT_FIELDS, structure_bei, bei_participant_pdf,
                  bei_company_pdf, bei_radar_png)
+from charts import radar_chart
+from pdf_report import individual_pdf
 
 # ---------- konfigurasi ----------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -94,7 +96,7 @@ def catalog():
         insts.append(dict(
             key=inst["key"], name=inst["name"], intro=inst["intro"],
             scale=inst.get("scale"), mcq=bool(inst.get("mcq")),
-            items=[dict(n=it["n"], text=it["text"], opts=it.get("opts"), img=it.get("img"))
+            items=[dict(n=it["n"], text=it.get("text"), opts=it.get("opts"), img=it.get("img"))
                    for it in inst["items"]]))
     dims = {k: dict(label=v["label"], radar=v["radar"], dir=v["dir"],
                     target=v["target"], flip=k in FLIP) for k, v in DIMS.items()}
@@ -135,12 +137,26 @@ def del_training(tid: str, authorization: Optional[str] = Header(None)):
     return {"ok": True}
 
 # ---------- asesmen peserta ----------
+class CodeIn(BaseModel):
+    training_id: str
+    code: str
+
+@app.post("/api/verify-code")
+def verify_code(body: CodeIn):
+    t = (sb.table("trainings").select("*").eq("id", body.training_id).execute().data or [None])[0]
+    if not t:
+        raise HTTPException(404, "Training tidak ditemukan")
+    if t.get("access_code") and body.code != t["access_code"]:
+        raise HTTPException(403, "Kode akses salah")
+    return {"ok": True}
+
 class SubmitIn(BaseModel):
     training_id: str
     name: str
     email: str
     department: Optional[str] = ""
     job_level: Optional[str] = ""
+    access_code: Optional[str] = ""
     answers: dict          # {"PSS:1": 3, ...}  (instrument:item_n -> skor mentah)
 
 @app.post("/api/assessment/submit")
@@ -149,9 +165,8 @@ def submit_assessment(body: SubmitIn):
     if not t:
         raise HTTPException(404, "Training tidak ditemukan")
     t = t[0]
-    if t.get("access_code"):
-        code = (body.answers or {}).pop("__code__", None)
-        # kode akses dikirim lewat field terpisah di frontend; di sini cukup verifikasi training
+    if t.get("access_code") and body.access_code != t["access_code"]:
+        raise HTTPException(403, "Kode akses salah")
     email = body.email.strip().lower()
     dup = sb.table("respondents").select("id").eq("training_id", body.training_id).eq("email", email).execute().data
     if dup:
@@ -242,6 +257,7 @@ class ExamIn(BaseModel):
     package: str
     name: str
     email: str
+    access_code: Optional[str] = ""
     answers: dict      # {no: index 0-3}
 
 @app.post("/api/exam/submit")
@@ -249,6 +265,9 @@ def exam_submit(body: ExamIn):
     pkg = EXAM_PACKAGES.get(body.package)
     if not pkg:
         raise HTTPException(404, "Paket ujian tidak ditemukan")
+    t = (sb.table("trainings").select("*").eq("id", body.training_id).execute().data or [None])[0]
+    if t and t.get("access_code") and body.access_code != t["access_code"]:
+        raise HTTPException(403, "Kode akses salah")
     correct = sum(1 for q in pkg["questions"] if body.answers.get(str(q["n"])) == q["key"])
     score = round(correct / len(pkg["questions"]) * 100)
     passed = score >= pkg["passing"]
@@ -302,6 +321,148 @@ def bei_pdf(session_id: str, authorization: Optional[str] = Header(None)):
     return Response(content=pdf if isinstance(pdf, bytes) else pdf.encode("latin-1"),
                     media_type="application/pdf",
                     headers={"Content-Disposition": f"attachment; filename=BEI_{s['participant_name']}.pdf"})
+
+
+@app.get("/api/assessment/{rid}/pdf")
+def assessment_pdf(rid: str, authorization: Optional[str] = Header(None)):
+    _check(authorization, "admin")
+    resp = (sb.table("respondents").select("*").eq("id", rid).execute().data or [None])[0]
+    if not resp:
+        raise HTTPException(404, "Responden tidak ditemukan")
+    rows = sb.table("responses").select("*").eq("respondent_id", rid).execute().data or []
+    t = (sb.table("trainings").select("*").eq("id", resp["training_id"]).execute().data or [{}])[0]
+    answers = {(r["instrument"], r["item_n"]): r["score"] for r in rows}
+    insts = [i for i in INSTRUMENTS if i["key"] in _enabled(t)]
+    scores = compute_dim_scores(answers, instruments=insts)
+    groups = grouped_insights(scores)
+    png = radar_chart(scores, f"Profil {resp['full_name']}")
+    pdf = individual_pdf(resp["full_name"], t.get("name", ""), resp.get("department"),
+                         resp.get("job_level"), scores, groups, png)
+    data = pdf if isinstance(pdf, bytes) else pdf.encode("latin-1")
+    return Response(content=data, media_type="application/pdf",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=Hasil_{resp['full_name'].replace(' ', '_')}.pdf"})
+
+@app.get("/api/admin/respondents/{training_id}")
+def list_respondents(training_id: str, authorization: Optional[str] = Header(None)):
+    _check(authorization, "admin")
+    return sb.table("respondents").select("*").eq("training_id", training_id).order("created_at").execute().data or []
+
+
+# ---------- email & sertifikat ----------
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from fpdf import FPDF
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+MAIL_FROM = os.environ.get("MAIL_FROM") or SMTP_USER
+
+class CertPDF(FPDF):
+    def footer(self):
+        self.set_y(-16)
+        self.set_font("helvetica", "I", 8)
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 8, "Certified by Cerita Jiwa Training Center", align="C")
+
+def _certificate_pdf(name: str, program: str) -> bytes:
+    pdf = CertPDF("L")
+    pdf.add_page("L")
+    pdf.set_fill_color(52, 74, 97)
+    pdf.rect(0, 0, 297, 70, "F")
+    try:
+        pdf.image("logo-white.png", x=128, y=12, w=42)
+    except Exception:
+        pass
+    pdf.set_y(78)
+    pdf.set_font("helvetica", "B", 30)
+    pdf.set_text_color(52, 74, 97)
+    pdf.cell(0, 14, "Certificate of Completion", align="C", ln=1)
+    pdf.ln(4)
+    pdf.set_font("helvetica", "", 13)
+    pdf.set_text_color(109, 111, 113)
+    pdf.cell(0, 8, "This certificate is proudly presented to", align="C", ln=1)
+    pdf.ln(3)
+    pdf.set_font("helvetica", "B", 26)
+    pdf.set_text_color(52, 74, 97)
+    pdf.cell(0, 14, _pdf_safe(name), align="C", ln=1)
+    pdf.ln(3)
+    pdf.set_font("helvetica", "", 13)
+    pdf.set_text_color(109, 111, 113)
+    pdf.cell(0, 8, "for successfully completing", align="C", ln=1)
+    pdf.set_font("helvetica", "B", 17)
+    pdf.set_text_color(52, 74, 97)
+    pdf.cell(0, 11, _pdf_safe(program), align="C", ln=1)
+    pdf.ln(6)
+    pdf.set_font("helvetica", "", 12)
+    pdf.set_text_color(109, 111, 113)
+    pdf.cell(0, 8, datetime.now().strftime("%d %B %Y"), align="C", ln=1)
+    pdf.ln(10)
+    pdf.set_draw_color(111, 194, 180)
+    pdf.set_line_width(0.8)
+    pdf.line(118, pdf.get_y(), 180, pdf.get_y())
+    pdf.ln(2)
+    pdf.set_font("helvetica", "", 11)
+    pdf.cell(0, 7, "Cerita Jiwa Training Center", align="C", ln=1)
+    out = pdf.output()
+    return out if isinstance(out, bytes) else out.encode("latin-1")
+
+def _pdf_safe(s):
+    return (str(s).replace("\\u2019", "'").replace("\\u2018", "'")
+            .replace("\\u201c", '"').replace("\\u201d", '"')
+            .encode("latin-1", errors="replace").decode("latin-1"))
+
+def _send_mail(to: str, subject: str, body: str, attachments: list):
+    """attachments: list of (filename, bytes). Raise kalau SMTP belum dikonfigurasi."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+        raise HTTPException(501, "Email belum dikonfigurasi: isi SMTP_HOST/SMTP_USER/SMTP_PASS di Environment Variables Render.")
+    msg = MIMEMultipart()
+    msg["From"] = MAIL_FROM
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+    for fn, data in attachments:
+        part = MIMEApplication(data, _subtype="pdf")
+        part.add_header("Content-Disposition", "attachment", filename=fn)
+        msg.attach(part)
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(MAIL_FROM, [to], msg.as_string())
+
+@app.post("/api/admin/email/assessment/{rid}")
+def email_assessment(rid: str, authorization: Optional[str] = Header(None)):
+    _check(authorization, "admin")
+    pdf_data = assessment_pdf(rid, authorization).body
+    if not isinstance(pdf_data, bytes):
+        pdf_data = bytes(pdf_data)
+    resp = (sb.table("respondents").select("*").eq("id", rid).execute().data or [None])[0]
+    if not resp:
+        raise HTTPException(404, "Responden tidak ditemukan")
+    _send_mail(resp["email"],
+               f"Hasil Asesmen Anda - Cerita Jiwa",
+               f"Halo {resp['full_name']},\\n\\nTerima kasih telah mengikuti asesmen. Berikut lampiran laporan hasil asesmen Anda.\\n\\nSalam hangat,\\nCerita Jiwa Training Center",
+               [(f"Hasil_Asesmen_{resp['full_name'].replace(' ', '_')}.pdf", pdf_data)])
+    return {"ok": True, "to": resp["email"]}
+
+@app.post("/api/admin/email/certificate/{attempt_id}")
+def email_certificate(attempt_id: str, authorization: Optional[str] = Header(None)):
+    _check(authorization, "admin")
+    a = (sb.table("exam_attempts").select("*").eq("id", attempt_id).execute().data or [None])[0]
+    if not a:
+        raise HTTPException(404, "Percobaan ujian tidak ditemukan")
+    if not a.get("passed"):
+        raise HTTPException(400, "Peserta belum lulus - sertifikat hanya untuk yang lulus.")
+    program = EXAM_PACKAGES.get(a.get("package"), {}).get("title", "Training Cerita Jiwa")
+    cert = _certificate_pdf(a["full_name"], program)
+    _send_mail(a["email"],
+               f"Sertifikat Kelulusan Anda - Cerita Jiwa",
+               f"Selamat {a['full_name']}!\\n\\nAnda dinyatakan LULUS ({program}) dengan nilai {a['score']}.\\nLampiran: sertifikat PDF + badge yang dapat Anda cantumkan di LinkedIn (bagian Licenses & Certifications).\\n\\nSalam hangat,\\nCerita Jiwa Training Center",
+               [(f"Sertifikat_{a['full_name'].replace(' ', '_')}.pdf", cert)])
+    return {"ok": True, "to": a["email"]}
 
 @app.get("/api/health")
 def health():
